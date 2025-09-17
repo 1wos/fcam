@@ -36,14 +36,15 @@ class SimpleParallelCrawler:
         "완료"
     ]
     
-    # M3 칩 최적화 설정
-    MAX_WORKERS = 4  # 스레드 풀 워커 수
-    MAX_CONCURRENT_COURSES = 8  # 동시 강의 수집 수
+    # M3 칩 최적화 설정 (16GB 메모리) - 속도 우선
+    MAX_WORKERS = 12  # 스레드 풀 워커 수 (M3 8코어 + 하이퍼스레딩)
+    MAX_CONCURRENT_COURSES = 20  # 동시 강의 수집 수 
     
     TIMEOUTS = {
-        'default': 30000,
-        'navigation': 60000,
-        'image_load': 10000
+        'default': 15000,  # 15초로 단축 (속도 우선)
+        'navigation': 20000,  # 20초로 단축
+        'image_load': 60000,  # 60초로 단축 (속도와 안정성 균형)
+        'network_idle': 10000  # 10초로 단축 (빠른 처리)
     }
     
     HEADERS = {
@@ -64,13 +65,30 @@ class SimpleParallelCrawler:
         }
     }
     
+    # 개선된 선택자들
     SELECTORS = {
         'main_category': ('div.GNBDesktopCategoryItem_container__ln5E6 '
                          'a[href*="category_online"]'),
         'sub_category': ('li.GNBDesktopCategoryItem_subCategory__twmcG '
                         'a[href*="category_online"]'),
-        'course_card': '[data-e2e="course-card"], .course-card, .course-item',
-        'course_link': 'a[href*="/data_online_"]',
+        # 강의 카드 선택자 개선
+        'course_card': [
+            '[data-e2e="course-card"]',
+            'div[class*="CourseCard_courseCard__"]',
+            'div[class*="CourseCard"][class*="courseCard__"]',
+            'article[class*="course"]',
+            'div[class*="course-card"]',
+            'div[class*="card"]'
+        ],
+        # 강의 링크 선택자 개선 및 우선순위 부여
+        'course_link': [
+            'a[href*="/data_online_"]',
+            'a[href*="/dgn_online_"]', 
+            'a[href*="/biz_online_"]',
+            'a[href*="/course_"]',
+            'a[href*="/online_"]',
+            'a[href^="/"]'  # 상대 경로 링크도 포함
+        ],
         'category_nav': '[data-e2e="navigation-category"]'
     }
     
@@ -191,15 +209,27 @@ class SimpleParallelCrawler:
         return browser, page
     
     def _safe_page_load(self, page, url, retries=3):
-        """안전한 페이지 로딩."""
+        """안전한 페이지 로딩 - 개선된 버전."""
         for attempt in range(retries):
             try:
                 page.goto(url, timeout=self.TIMEOUTS['navigation'])
-                page.wait_for_load_state("networkidle", timeout=30000)
+                
+                # networkidle 대신 domcontentloaded 사용 (더 안정적)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)  # 10초
+                    # 추가로 짧은 네트워크 대기 시도
+                    page.wait_for_load_state("networkidle", timeout=5000)  # 5초로 단축
+                except Exception:
+                    # networkidle 실패해도 domcontentloaded는 성공했으므로 계속 진행
+                    pass
+                
                 return True
-            except Exception:
+            except Exception as e:
                 if attempt < retries - 1:
+                    self._log_progress(f"페이지 로드 재시도 {attempt + 1}/{retries}: {str(e)[:100]}")
                     page.wait_for_timeout(3000)
+                else:
+                    self._log_error(f"페이지 로드 최종 실패: {url}", e)
         return False
     
     def _scroll_page(self, page):
@@ -215,20 +245,13 @@ class SimpleParallelCrawler:
                 break
             last_height = new_height
     
-    def _wait_for_images_to_load(self, page, timeout=30000):
-        """이미지 완전 로딩 대기."""
-        try:
-            # 모든 이미지가 로드될 때까지 대기
-            page.wait_for_function("""
-                () => {
-                    const images = Array.from(document.querySelectorAll('img'));
-                    return images.every(img => {
-                        return img.complete && img.naturalHeight !== 0;
-                    });
-                }
-            """, timeout=timeout)
+    def _wait_for_images_to_load(self, page, timeout=None):
+        """이미지 완전 로딩 대기 - 개선된 버전."""
+        if timeout is None:
+            timeout = self.TIMEOUTS['image_load']
             
-            # lazy loading 이미지들 강제 로드
+        try:
+            # 1단계: lazy loading 이미지들 먼저 강제 로드
             page.evaluate("""
                 () => {
                     const lazyImages = document.querySelectorAll('img[data-src]');
@@ -240,13 +263,12 @@ class SimpleParallelCrawler:
                 }
             """)
             
-            # srcset 속성 정규화
+            # 2단계: srcset 속성 정규화
             page.evaluate("""
                 () => {
                     const sources = document.querySelectorAll('source[srcset]');
                     sources.forEach(source => {
                         if (source.srcset && source.srcset.trim()) {
-                            // 상대 경로를 절대 경로로 변환
                             const baseUrl = window.location.origin;
                             source.srcset = source.srcset.split(',').map(src => {
                                 src = src.trim().split(' ')[0];
@@ -262,8 +284,29 @@ class SimpleParallelCrawler:
                 }
             """)
             
-            self._log_progress("이미지 로딩 완료")
-            return True
+            # 3단계: 이미지 로딩 대기 (더 관대한 조건)
+            try:
+                page.wait_for_function("""
+                    () => {
+                        const images = Array.from(document.querySelectorAll('img'));
+                        if (images.length === 0) return true;
+                        
+                        // 80% 이상의 이미지가 로드되면 성공으로 간주
+                        const loadedImages = images.filter(img => {
+                            return img.complete && img.naturalHeight !== 0;
+                        });
+                        
+                        return (loadedImages.length / images.length) >= 0.8;
+                    }
+                """, timeout=timeout)
+                
+                self._log_progress("이미지 로딩 완료 (80% 이상)")
+                return True
+                
+            except Exception:
+                # 타임아웃이 발생해도 계속 진행 (부분적 로딩 허용)
+                self._log_progress("이미지 로딩 타임아웃 - 부분적 로딩으로 진행")
+                return True
             
         except Exception as e:
             self._log_error(f"이미지 로딩 대기 중 오류", e)
@@ -282,7 +325,7 @@ class SimpleParallelCrawler:
         
         try:
             # 페이지가 완전히 로드될 때까지 대기
-            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=self.TIMEOUTS['network_idle'])
             
             # 카테고리 버튼 클릭 - 여러 선택자 시도
             selectors = [
@@ -364,7 +407,33 @@ class SimpleParallelCrawler:
         """하위 카테고리 추출."""
         self._log_step_start("하위 카테고리 수집")
         self._prepare_navigation(page)
-        links = page.locator(self.SELECTORS['sub_category']).all()
+        
+        # 여러 선택자로 하위 카테고리 찾기
+        sub_category_selectors = [
+            'li.GNBDesktopCategoryItem_subCategory__twmcG a[href*="category_online"]',
+            'li[class*="subCategory"] a[href*="category_online"]',
+            'li[class*="sub-category"] a[href*="category_online"]',
+            'a[href*="category_online"]:not([class*="main"])',
+            'a[href*="category_online"]'
+        ]
+        
+        links = []
+        for selector in sub_category_selectors:
+            try:
+                found_links = page.locator(selector).all()
+                if found_links:
+                    links = found_links
+                    self._log_progress(f"하위 카테고리 선택자 성공: {selector} ({len(links)}개)")
+                    break
+            except Exception as e:
+                self._log_error(f"선택자 실패: {selector}", e)
+                continue
+        
+        if not links:
+            self._log_error("모든 하위 카테고리 선택자 실패")
+            self.progress['total_subcategories'] = 0
+            self._log_step_complete("하위 카테고리 수집", 0)
+            return
         
         for i, link in enumerate(links, 1):
             try:
@@ -443,18 +512,17 @@ class SimpleParallelCrawler:
         self._log_progress(f"HTML 저장 완료: {safe_name}.html")
     
     def _extract_title(self, card, course_url=None):
-        """강의 제목 추출."""
+        """강의 제목 추출 - 개선된 버전."""
         # 먼저 저장된 매핑에서 찾기
         if course_url and course_url in self.course_titles:
             return self.course_titles[course_url]
         
-        # DOM에서 추출 - 사용자가 제공한 정확한 선택자 우선 사용
+        # DOM에서 추출 - 더 정확한 선택자들
         selectors = [
             '.CourseCard_courseCardTitle__1HQgO',  # 정확한 클래스명
-            '[data-e2e="display-card"]',  # data-e2e 속성
+            '[data-e2e="course-title"]',  # data-e2e 속성
             'h3', 'h4', '.course-title', '.title', 
-            '[data-e2e="course-title"]', '.course-name',
-            '[class*="title"]', '[class*="Title"]'
+            '.course-name', '[class*="title"]', '[class*="Title"]'
         ]
         
         for selector in selectors:
@@ -462,24 +530,32 @@ class SimpleParallelCrawler:
             if element.count() > 0:
                 title = element.text_content().strip()
                 if (title and len(title) > 3 and not title.isdigit() 
-                    and not title.endswith('+')):
+                    and not title.endswith('+') and not title.startswith('사전')):
                     return title
         
-        # 마지막 fallback - 숫자가 아닌 텍스트 찾기
+        # 마지막 fallback - 더 엄격한 필터링
         full_text = card.text_content().strip()
         lines = [line.strip() for line in full_text.split('\n') 
                 if line.strip()]
         
+        # 제외할 패턴들
+        exclude_patterns = [
+            '사전 설문', '고민을 들어보았습니다', '강사님 한마디',
+            '수강생', '설문', '고민', '한마디', '질문', '답변'
+        ]
+        
         for line in lines:
             if (len(line) > 3 and not line.isdigit() 
-                and not line.startswith(('+', '⚠️')) 
-                and not line.endswith('+')):
+                and not line.startswith(('+', '⚠️', '사전', '고민', '강사님')) 
+                and not line.endswith('+') 
+                and not any(pattern in line for pattern in exclude_patterns)):
                 return line
                 
         return "제목 없음"
     
     def _extract_course_url(self, card):
-        """강의 URL 추출."""
+        """강의 URL 추출 - 단순화된 버전."""
+        # 1. 카드 자체가 링크인 경우
         try:
             url = card.get_attribute('href')
             if url:
@@ -487,6 +563,7 @@ class SimpleParallelCrawler:
         except Exception:
             pass
         
+        # 2. 카드 내부의 링크 찾기
         try:
             link = card.locator(self.SELECTORS['course_link']).first
             if link.count() > 0:
@@ -494,7 +571,138 @@ class SimpleParallelCrawler:
         except Exception:
             pass
         
+        # 3. 모든 링크 요소를 찾아서 검사
+        try:
+            all_links = card.locator('a').all()
+            for link in all_links:
+                try:
+                    url = link.get_attribute('href')
+                    if url and not url.startswith('#') and not url.startswith('javascript:'):
+                        return url
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        
         return None
+    
+    def _extract_course_url_with_debug(self, card, card_index):
+        """디버깅 정보와 함께 강의 URL 추출."""
+        debug_info = []
+        
+        # 1. 카드 자체가 링크인지 확인
+        try:
+            url = card.get_attribute('href')
+            if url:
+                debug_info.append(f"카드 자체 href: {url}")
+                if self._is_valid_course_url(url):
+                    return url
+        except Exception as e:
+            debug_info.append(f"카드 href 추출 실패: {e}")
+        
+        # 2. 내부 링크들 확인
+        for i, link_selector in enumerate(self.SELECTORS['course_link']):
+            try:
+                links = card.locator(link_selector).all()
+                for j, link in enumerate(links):
+                    try:
+                        url = link.get_attribute('href')
+                        if url:
+                            debug_info.append(f"선택자 {i} 링크 {j}: {url}")
+                            if self._is_valid_course_url(url):
+                                return url
+                    except Exception:
+                        continue
+            except Exception as e:
+                debug_info.append(f"선택자 {i} 실패: {e}")
+        
+        # 3. 모든 a 태그 확인
+        try:
+            all_links = card.locator('a').all()
+            for j, link in enumerate(all_links):
+                try:
+                    url = link.get_attribute('href')
+                    if url:
+                        debug_info.append(f"모든 링크 {j}: {url}")
+                        if self._is_valid_course_url(url):
+                            return url
+                except Exception:
+                    continue
+        except Exception as e:
+            debug_info.append(f"모든 링크 검색 실패: {e}")
+        
+        # 디버깅 정보가 있으면 로깅 (실패한 경우에만)
+        if not any("유효한 URL" in info for info in debug_info):
+            self._log_progress(f"카드 {card_index} URL 추출 디버깅:")
+            for info in debug_info[:3]:  # 처음 3개만 출력
+                self._log_progress(f"  {info}")
+        
+        return None
+    
+    def _analyze_card_content(self, card, card_index):
+        """카드 내용 분석 (디버깅용)."""
+        try:
+            # 카드의 기본 정보
+            tag_name = card.evaluate('el => el.tagName')
+            class_name = card.get_attribute('class') or 'no-class'
+            
+            # 텍스트 내용 (처음 100자만)
+            text_content = card.text_content().strip()[:100]
+            
+            # 내부 링크 개수
+            link_count = len(card.locator('a').all())
+            
+            return f"태그:{tag_name}, 클래스:{class_name[:50]}, 링크수:{link_count}, 텍스트:{text_content}"
+            
+        except Exception as e:
+            return f"분석 실패: {e}"
+    
+    def _is_valid_course_url(self, url):
+        """유효한 강의 URL인지 확인."""
+        if not url or len(url) < 5:
+            return False
+            
+        # 제외할 URL 패턴 - 이벤트만 제외
+        exclude_patterns = [
+            '/event_online_',  # 이벤트 페이지만 제외
+            'javascript:',
+            'mailto:',
+            'tel:',
+            '#',
+            '/category_online'  # 카테고리 페이지도 제외
+        ]
+        
+        # 제외 패턴 체크
+        for pattern in exclude_patterns:
+            if pattern in url:
+                return False
+        
+        # FastCampus 도메인이면서 온라인 강의 관련 URL이면 모두 허용
+        if url.startswith('http'):
+            # 절대 URL인 경우 FastCampus 도메인 체크
+            if 'fastcampus.co.kr' in url:
+                # 온라인 강의 관련 패턴이 있으면 허용
+                online_patterns = [
+                    '/data_online_',
+                    '/dgn_online_', 
+                    '/biz_online_',
+                    '/course_',
+                    '/online_',
+                    'sharex.fastcampus.co.kr'  # 추가 도메인
+                ]
+                return any(pattern in url for pattern in online_patterns)
+        elif url.startswith('/'):
+            # 상대 URL인 경우 온라인 강의 패턴이 있으면 허용
+            online_patterns = [
+                '/data_online_',
+                '/dgn_online_', 
+                '/biz_online_',
+                '/course_',
+                'online_'  # /를 제거하여 더 포괄적으로
+            ]
+            return any(pattern in url for pattern in online_patterns)
+        
+        return False
     
     def _normalize_url(self, url):
         """URL 정규화."""
@@ -512,7 +720,7 @@ class SimpleParallelCrawler:
             try:
                 response = requests.get(
                     url, 
-                    timeout=15, 
+                    timeout=30,  # 30초로 증가 (이미지 안정성 우선)
                     headers=self.HEADERS['image']
                 )
                 if response.status_code == 200:
@@ -658,8 +866,8 @@ class SimpleParallelCrawler:
         
         return False
     
-    def _extract_courses_from_subcategory(self, subcategory, max_courses=20):
-        """하위 카테고리에서 강의 정보 추출 (병렬 처리용)."""
+    def _extract_courses_from_subcategory(self, subcategory, max_courses=None):
+        """하위 카테고리에서 강의 정보 추출 (병렬 처리용) - URL 추출 개선."""
         with sync_playwright() as p:
             browser, page = self._setup_browser(p)
             
@@ -677,7 +885,7 @@ class SimpleParallelCrawler:
                 # 먼저 JSON에서 강의 제목들 추출
                 self._extract_course_titles_from_json(page)
                 
-                # 강의 카드 컨테이너 찾기 - 여러 선택자 시도
+                # 강의 카드 컨테이너 찾기 - 단순화된 방식
                 card_selectors = [
                     '[data-e2e="course-card"]',
                     '.course-card', 
@@ -691,23 +899,34 @@ class SimpleParallelCrawler:
                 
                 cards = []
                 for selector in card_selectors:
-                    found_cards = page.locator(selector).all()
-                    if found_cards:
-                        cards = found_cards
-                        self._log_progress(f"강의 카드 발견: {len(cards)}개 "
-                                         f"(선택자: {selector})")
-                        break
+                    try:
+                        found_cards = page.locator(selector).all()
+                        if found_cards:
+                            cards = found_cards
+                            self._log_progress(f"강의 카드 발견: {len(cards)}개 "
+                                             f"(선택자: {selector})")
+                            break
+                    except Exception:
+                        continue
                 
                 if not cards:
                     # 마지막 fallback - 링크 요소들을 카드로 사용
-                    cards = page.locator(self.SELECTORS['course_link']).all()
-                    self._log_progress(f"대체 선택자로 강의 카드 발견: {len(cards)}개 "
-                                     f"(선택자: {self.SELECTORS['course_link']})")
+                    try:
+                        cards = page.locator(self.SELECTORS['course_link']).all()
+                        if cards:
+                            self._log_progress(f"대체 선택자로 강의 카드 발견: {len(cards)}개")
+                        else:
+                            self._log_error(f"강의 카드를 찾을 수 없음: {subcategory['하위카테고리링크']}")
+                            return []
+                    except Exception as e:
+                        self._log_error(f"강의 카드 검색 실패", e)
+                        return []
                 
                 collected_courses = []
                 collected = 0
+                
                 for i, card in enumerate(cards, 1):
-                    if collected >= max_courses:
+                    if max_courses is not None and collected >= max_courses:
                         break
                         
                     try:
@@ -715,9 +934,11 @@ class SimpleParallelCrawler:
                         if not url:
                             continue
                         
+                        # URL 정규화
                         if url.startswith('/'):
                             url = urljoin(self.base_url, url)
                         
+                        # 단순한 필터링 (작동하는 코드와 동일)
                         if '/event_online_' in url or url in self.seen_urls:
                             continue
                         
@@ -733,7 +954,7 @@ class SimpleParallelCrawler:
                         }
                         
                         collected_courses.append(course_data)
-                        self._log_progress(f"강의 발견: {title}")
+                        self._log_progress(f"강의 발견: {title} -> {url}")
                         self._collect_thumbnails(card, url)
                         collected += 1
                         
@@ -741,7 +962,7 @@ class SimpleParallelCrawler:
                         self._log_error(f"강의 처리 중 오류 (카드 {i})", e)
                         continue
                 
-                self._log_progress(f"강의 수집 완료: {collected}개")
+                self._log_progress(f"강의 수집 완료: {collected}개 (총 {len(cards)}개 카드 중)")
                 return collected_courses
                 
             finally:
@@ -809,14 +1030,63 @@ class SimpleParallelCrawler:
                 
                 soup = BeautifulSoup(html_content, 'html.parser')
                 
-                title_selectors = ['h1', '[data-e2e="course-title"]', '.title']
+                # 더 정확한 강의명 추출
+                title_selectors = [
+                    'h1[data-e2e="course-title"]',  # 가장 정확한 선택자
+                    'h1.course-title',
+                    'h1.title',
+                    '[data-e2e="course-title"]',
+                    '.course-title',
+                    '.title'
+                ]
                 title = "제목 없음"
+                
+                # 제외할 패턴들
+                exclude_patterns = [
+                    'root layout', '강사님 한마디', '강사님 한 마디',
+                    '사전 설문', '고민을 들어보았습니다', '정가',
+                    'SHARE XONLINE DESIGN ACADEMY', 'root', 'layout',
+                    '강사님', '한마디', '사전', '고민', '설문'
+                ]
                 
                 for selector in title_selectors:
                     element = soup.select_one(selector)
                     if element and element.get_text().strip():
-                        title = element.get_text().strip()
-                        if title != "root layout":
+                        candidate_title = element.get_text().strip()
+                        
+                        # 제외 패턴 체크
+                        if (len(candidate_title) > 5 and 
+                            not any(pattern in candidate_title for pattern in exclude_patterns) and
+                            not candidate_title.startswith(('사전', '고민', '강사님', '정가', 'SHARE'))):
+                            title = candidate_title
+                            break
+                
+                # 여전히 제목을 찾지 못한 경우, 페이지 제목(title 태그) 확인
+                if title == "제목 없음":
+                    title_tag = soup.find('title')
+                    if title_tag:
+                        page_title = title_tag.get_text().strip()
+                        # "| 패스트캠퍼스" 같은 접미사 제거
+                        if '| 패스트캠퍼스' in page_title:
+                            page_title = page_title.split('| 패스트캠퍼스')[0].strip()
+                        
+                        if (len(page_title) > 5 and 
+                            not any(pattern in page_title for pattern in exclude_patterns) and
+                            not page_title.startswith(('사전', '고민', '강사님', '정가', 'SHARE'))):
+                            title = page_title
+                
+                # 여전히 제목을 찾지 못한 경우, 페이지 전체에서 가장 긴 텍스트 찾기
+                if title == "제목 없음":
+                    all_text_elements = soup.find_all(['h1', 'h2', 'h3', 'h4', 'div', 'span'], 
+                                                    class_=lambda x: x and any(keyword in x.lower() 
+                                                    for keyword in ['title', 'name', 'course', 'lecture']))
+                    
+                    for element in all_text_elements:
+                        candidate_title = element.get_text().strip()
+                        if (len(candidate_title) > 10 and len(candidate_title) < 200 and
+                            not any(pattern in candidate_title for pattern in exclude_patterns) and
+                            not candidate_title.startswith(('사전', '고민', '강사님', '정가', 'SHARE'))):
+                            title = candidate_title
                             break
                 
                 # 강의 상세 페이지에서 이미지 수집
@@ -846,7 +1116,7 @@ class SimpleParallelCrawler:
         return '\n'.join(lines) if lines else "텍스트 없음"
     
     def _validate_html_images(self, html_file):
-        """HTML 파일의 이미지 상태 검증."""
+        """HTML 파일의 이미지 상태 검증 - 개선된 버전."""
         try:
             with open(html_file, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -863,7 +1133,7 @@ class SimpleParallelCrawler:
                 src = img.get('src', '')
                 data_src = img.get('data-src', '')
                 
-                # 깨진 이미지 체크
+                # 깨진 이미지 체크 (더 관대한 기준)
                 if not src and not data_src:
                     broken_images += 1
                 elif src and (src.startswith('/') or src.startswith('//')):
@@ -875,16 +1145,18 @@ class SimpleParallelCrawler:
                 if not srcset or srcset.strip() == '':
                     empty_srcset += 1
             
-            # 검증 결과 로깅
-            if broken_images > 0 or empty_srcset > 0:
+            # 검증 결과 로깅 (더 관대한 기준)
+            broken_ratio = broken_images / total_images if total_images > 0 else 0
+            
+            if broken_ratio > 0.3:  # 30% 이상 깨진 이미지가 있을 때만 경고
                 self._log_error(f"이미지 문제 발견: {html_file.name}")
                 self._log_error(f"  - 총 이미지: {total_images}개")
-                self._log_error(f"  - 깨진 이미지: {broken_images}개")
+                self._log_error(f"  - 깨진 이미지: {broken_images}개 ({broken_ratio:.1%})")
                 self._log_error(f"  - 빈 srcset: {empty_srcset}개")
                 self._log_error(f"  - 상대 경로: {relative_urls}개")
             else:
                 self._log_progress(f"이미지 검증 통과: {html_file.name} "
-                                 f"({total_images}개 이미지)")
+                                 f"({total_images}개 이미지, 깨진 이미지: {broken_images}개)")
                 
         except Exception as e:
             self._log_error(f"이미지 검증 중 오류: {html_file}", e)
@@ -1048,14 +1320,14 @@ class SimpleParallelCrawler:
                         future = executor.submit(
                             self._extract_courses_from_subcategory, 
                             subcategory, 
-                            max_courses=20
+                            max_courses=None  # 제한 없음
                         )
                         futures.append(future)
                     
                     # 결과 수집
                     for i, future in enumerate(futures):
                         try:
-                            courses = future.result(timeout=300)  # 5분 타임아웃
+                            courses = future.result(timeout=180)  # 3분 타임아웃 (M3 성능 활용)
                             if courses:
                                 self.data['courses'].extend(courses)
                                 self.progress['completed_subcategories'] += 1
@@ -1082,7 +1354,7 @@ class SimpleParallelCrawler:
                     # 결과 수집
                     for i, future in enumerate(futures):
                         try:
-                            detail = future.result(timeout=300)  # 5분 타임아웃
+                            detail = future.result(timeout=120)  # 2분 타임아웃 (M3 성능 활용)
                             if detail:
                                 self.data['course_details'].append(detail)
                                 self.progress['completed_details'] += 1
@@ -1125,10 +1397,12 @@ class SimpleParallelCrawler:
                 browser.close()
                 self._log_progress("브라우저 종료")
 
+
 def main():
     """Application entry point."""
     crawler = SimpleParallelCrawler()
     crawler.run()
+
 
 if __name__ == "__main__":
     main()
