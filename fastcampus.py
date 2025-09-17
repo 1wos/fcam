@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-FastCampus 병렬크롤러
-MVP 크롤러를 기반으로 병렬 처리를 추가한 버전
-"""
-
 import asyncio
 import json
 import os
@@ -220,6 +215,60 @@ class SimpleParallelCrawler:
                 break
             last_height = new_height
     
+    def _wait_for_images_to_load(self, page, timeout=30000):
+        """이미지 완전 로딩 대기."""
+        try:
+            # 모든 이미지가 로드될 때까지 대기
+            page.wait_for_function("""
+                () => {
+                    const images = Array.from(document.querySelectorAll('img'));
+                    return images.every(img => {
+                        return img.complete && img.naturalHeight !== 0;
+                    });
+                }
+            """, timeout=timeout)
+            
+            # lazy loading 이미지들 강제 로드
+            page.evaluate("""
+                () => {
+                    const lazyImages = document.querySelectorAll('img[data-src]');
+                    lazyImages.forEach(img => {
+                        if (img.dataset.src) {
+                            img.src = img.dataset.src;
+                        }
+                    });
+                }
+            """)
+            
+            # srcset 속성 정규화
+            page.evaluate("""
+                () => {
+                    const sources = document.querySelectorAll('source[srcset]');
+                    sources.forEach(source => {
+                        if (source.srcset && source.srcset.trim()) {
+                            // 상대 경로를 절대 경로로 변환
+                            const baseUrl = window.location.origin;
+                            source.srcset = source.srcset.split(',').map(src => {
+                                src = src.trim().split(' ')[0];
+                                if (src.startsWith('/')) {
+                                    return baseUrl + src;
+                                } else if (src.startsWith('//')) {
+                                    return 'https:' + src;
+                                }
+                                return src;
+                            }).join(', ');
+                        }
+                    });
+                }
+            """)
+            
+            self._log_progress("이미지 로딩 완료")
+            return True
+            
+        except Exception as e:
+            self._log_error(f"이미지 로딩 대기 중 오류", e)
+            return False
+    
     def _prepare_navigation(self, page):
         """네비게이션 준비."""
         try:
@@ -348,13 +397,50 @@ class SimpleParallelCrawler:
                                len(self.data['sub_categories']))
     
     def _save_html(self, page, name, category_type):
-        """HTML 콘텐츠 저장."""
+        """HTML 콘텐츠 저장 (이미지 최적화)."""
+        # 이미지 완전 로딩 대기
+        self._wait_for_images_to_load(page)
+        
+        # HTML 콘텐츠 가져오기 전에 추가 정리
+        page.evaluate("""
+            () => {
+                // 빈 srcset 속성 제거
+                const sources = document.querySelectorAll('source[srcset=""]');
+                sources.forEach(source => source.remove());
+                
+                // 상대 경로 이미지 URL들을 절대 경로로 변환
+                const images = document.querySelectorAll('img[src]');
+                const baseUrl = window.location.origin;
+                images.forEach(img => {
+                    if (img.src.startsWith('/')) {
+                        img.src = baseUrl + img.src;
+                    } else if (img.src.startsWith('//')) {
+                        img.src = 'https:' + img.src;
+                    }
+                });
+                
+                // data-src를 src로 변환 (lazy loading 해제)
+                const lazyImages = document.querySelectorAll('img[data-src]');
+                lazyImages.forEach(img => {
+                    if (img.dataset.src) {
+                        img.src = img.dataset.src;
+                        img.removeAttribute('data-src');
+                    }
+                });
+            }
+        """)
+        
         html_content = page.content()
         safe_name = name.replace('/', '_').replace(' ', '_')
         html_file = self.output_dir / f"{category_type}/{safe_name}.html"
         
         with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
+        
+        # 이미지 상태 검증
+        self._validate_html_images(html_file)
+        
+        self._log_progress(f"HTML 저장 완료: {safe_name}.html")
     
     def _extract_title(self, card, course_url=None):
         """강의 제목 추출."""
@@ -677,12 +763,49 @@ class SimpleParallelCrawler:
                 self._scroll_page(page)
                 page.wait_for_timeout(3000)
                 
+                # 강의 상세 페이지에서도 이미지 최적화 적용
+                self._wait_for_images_to_load(page)
+                
+                # HTML 저장 전 추가 정리
+                page.evaluate("""
+                    () => {
+                        // 빈 srcset 속성 제거
+                        const sources = document.querySelectorAll('source[srcset=""]');
+                        sources.forEach(source => source.remove());
+                        
+                        // 상대 경로 이미지 URL들을 절대 경로로 변환
+                        const images = document.querySelectorAll('img[src]');
+                        const baseUrl = window.location.origin;
+                        images.forEach(img => {
+                            if (img.src.startsWith('/')) {
+                                img.src = baseUrl + img.src;
+                            } else if (img.src.startsWith('//')) {
+                                img.src = 'https:' + img.src;
+                            }
+                        });
+                        
+                        // data-src를 src로 변환 (lazy loading 해제)
+                        const lazyImages = document.querySelectorAll('img[data-src]');
+                        lazyImages.forEach(img => {
+                            if (img.dataset.src) {
+                                img.src = img.dataset.src;
+                                img.removeAttribute('data-src');
+                            }
+                        });
+                    }
+                """)
+                
                 html_content = page.content()
                 safe_name = course_url.split('/')[-1]
                 
                 with open(self.output_dir / f"courses/{safe_name}.html", 
                           'w', encoding='utf-8') as f:
                     f.write(html_content)
+                
+                # 이미지 상태 검증
+                self._validate_html_images(self.output_dir / f"courses/{safe_name}.html")
+                
+                self._log_progress(f"강의 HTML 저장 완료: {safe_name}.html")
                 
                 soup = BeautifulSoup(html_content, 'html.parser')
                 
@@ -695,6 +818,9 @@ class SimpleParallelCrawler:
                         title = element.get_text().strip()
                         if title != "root layout":
                             break
+                
+                # 강의 상세 페이지에서 이미지 수집
+                self._collect_lecture_images(page, course_name)
                 
                 self._log_progress(f"강의 상세 정보 수집 완료: {title}")
                 
@@ -718,6 +844,123 @@ class SimpleParallelCrawler:
         
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         return '\n'.join(lines) if lines else "텍스트 없음"
+    
+    def _validate_html_images(self, html_file):
+        """HTML 파일의 이미지 상태 검증."""
+        try:
+            with open(html_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # 이미지 통계 수집
+            total_images = len(soup.find_all('img'))
+            broken_images = 0
+            empty_srcset = 0
+            relative_urls = 0
+            
+            for img in soup.find_all('img'):
+                src = img.get('src', '')
+                data_src = img.get('data-src', '')
+                
+                # 깨진 이미지 체크
+                if not src and not data_src:
+                    broken_images += 1
+                elif src and (src.startswith('/') or src.startswith('//')):
+                    relative_urls += 1
+            
+            # 빈 srcset 체크
+            for source in soup.find_all('source'):
+                srcset = source.get('srcset', '')
+                if not srcset or srcset.strip() == '':
+                    empty_srcset += 1
+            
+            # 검증 결과 로깅
+            if broken_images > 0 or empty_srcset > 0:
+                self._log_error(f"이미지 문제 발견: {html_file.name}")
+                self._log_error(f"  - 총 이미지: {total_images}개")
+                self._log_error(f"  - 깨진 이미지: {broken_images}개")
+                self._log_error(f"  - 빈 srcset: {empty_srcset}개")
+                self._log_error(f"  - 상대 경로: {relative_urls}개")
+            else:
+                self._log_progress(f"이미지 검증 통과: {html_file.name} "
+                                 f"({total_images}개 이미지)")
+                
+        except Exception as e:
+            self._log_error(f"이미지 검증 중 오류: {html_file}", e)
+    
+    def _collect_lecture_images(self, page, course_name):
+        """강의 상세 페이지에서 이미지 수집."""
+        try:
+            lecture_dir = self.output_dir / "lect_images" / course_name
+            lecture_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 강의 상세 페이지의 모든 이미지 수집
+            img_selectors = [
+                'img[alt*="강의"]',  # 강의 관련 이미지
+                'img[alt*="과정"]',  # 과정 관련 이미지
+                'img[alt*="커리큘럼"]',  # 커리큘럼 이미지
+                'img[alt*="프로젝트"]',  # 프로젝트 이미지
+                'img[class*="lecture"]',  # 강의 관련 클래스
+                'img[class*="course"]',  # 코스 관련 클래스
+                'img[class*="curriculum"]',  # 커리큘럼 관련 클래스
+                'img[class*="project"]',  # 프로젝트 관련 클래스
+                'img[data-nimg="fill"]',  # Next.js 이미지
+                'img[src*="course"]',  # course가 포함된 src
+                'img[src*="lecture"]',  # lecture가 포함된 src
+                'img[src*="curriculum"]'  # curriculum이 포함된 src
+            ]
+            
+            saved_count = 0
+            saved_urls = set()
+            # 갯수 제한 없이 모든 강의 관련 이미지 수집
+            
+            for selector in img_selectors:
+                try:
+                    images = page.locator(selector).all()
+                    for img in images:
+                            
+                        url = (img.get_attribute('src') or 
+                               img.get_attribute('data-src'))
+                        
+                        if url:
+                            url = self._normalize_url(url)
+                            
+                            # 중복 URL 체크
+                            if url in saved_urls:
+                                continue
+                            
+                            # 유효한 이미지 URL인지 확인
+                            if not self._is_valid_image_url(url):
+                                continue
+                                
+                            response = self._download_image(url)
+                            
+                            if (response and 
+                                len(response.content) > self.MIN_IMAGE_SIZE):
+                                ext = (os.path.splitext(urlparse(url).path)[1] 
+                                       or '.webp')
+                                filename = f"lecture_{saved_count + 1}{ext}"
+                                
+                                with open(lecture_dir / filename, 'wb') as f:
+                                    f.write(response.content)
+                                
+                                saved_urls.add(url)
+                                saved_count += 1
+                                self._log_progress(f"강의 이미지 저장: {filename} "
+                                                 f"({len(response.content)} bytes)")
+                except Exception as e:
+                    self._log_error(f"강의 이미지 처리 중 오류", e)
+                    continue
+            
+            if saved_count > 0:
+                self._log_progress(f"강의 이미지 수집 완료: {saved_count}개 "
+                                 f"({course_name}) - 제한 없음")
+            else:
+                self._log_progress(f"강의 이미지 없음: {course_name}")
+                
+        except Exception as e:
+            self._log_error(f"강의 이미지 수집 중 오류: {course_name}", e)
     
     def _validate_data(self, data_type, data):
         """데이터 품질 검증."""
@@ -772,18 +1015,20 @@ class SimpleParallelCrawler:
                 # 하위 카테고리 수집
                 self._extract_sub_categories(page)
                 
-                # HTML 저장 (일부만)
+                # HTML 저장 (전체)
                 self._log_step_start("HTML 저장")
-                for i, category in enumerate(self.data['main_categories'][:3], 1):
-                    self._log_progress(f"메인 카테고리 HTML 저장 ({i}/3): "
+                self._log_progress(f"메인 카테고리 HTML 저장 시작: {len(self.data['main_categories'])}개")
+                for i, category in enumerate(self.data['main_categories'], 1):
+                    self._log_progress(f"메인 카테고리 HTML 저장 ({i}/{len(self.data['main_categories'])}): "
                                      f"{category['메인카테고리']}")
                     if self._safe_page_load(page, category['메인카테고리링크']):
                         self._scroll_page(page)
                         self._save_html(page, category['메인카테고리'], 
                                       "main_categories")
                 
-                for i, category in enumerate(self.data['sub_categories'][:5], 1):
-                    self._log_progress(f"하위 카테고리 HTML 저장 ({i}/5): "
+                self._log_progress(f"하위 카테고리 HTML 저장 시작: {len(self.data['sub_categories'])}개")
+                for i, category in enumerate(self.data['sub_categories'], 1):
+                    self._log_progress(f"하위 카테고리 HTML 저장 ({i}/{len(self.data['sub_categories'])}): "
                                      f"{category['하위카테고리']}")
                     if self._safe_page_load(page, category['하위카테고리링크']):
                         self._scroll_page(page)
@@ -880,12 +1125,10 @@ class SimpleParallelCrawler:
                 browser.close()
                 self._log_progress("브라우저 종료")
 
-
 def main():
     """Application entry point."""
     crawler = SimpleParallelCrawler()
     crawler.run()
-
 
 if __name__ == "__main__":
     main()
